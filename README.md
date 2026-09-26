@@ -16,6 +16,9 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 以及最可能成因接口 `POST /v1/likely-cause`：令 `C` 为“顶事件发生且全部读数（0～16 个，可为空）
 成立”，在满足 `C` 的完整事件赋值中按独立先验乘积选出最可能的一组成因，返回该赋值、
 `condition_probability=P(C)` 与 `assignment_posterior=P(A)/P(C)`。
+还提供改版对比接口 `POST /v1/compare-trees`：两版故障树共用同一份 `events`，各自给出
+`gates` 与 `top`，返回 `added_probability=P(¬B∧R)`、`removed_probability=P(B∧¬R)`、
+`change_probability=P(B⊕R)` 与函数等价标记 `equivalent`。
 
 ## 快速启动（Docker Compose）
 
@@ -32,6 +35,7 @@ docker compose up --build
 - 联合观测诊断接口：`http://localhost:8000/v1/diagnose`
 - 下一步观测推荐接口：`http://localhost:8000/v1/inspect-next`
 - 最可能成因接口：`http://localhost:8000/v1/likely-cause`
+- 改版对比接口：`http://localhost:8000/v1/compare-trees`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -425,6 +429,75 @@ curl -X POST http://localhost:8000/v1/likely-cause \
 { "detail": "顶事件与观测相互矛盾：顶事件发生且全部读数同时成立在结构上不可能（结构约束的合取恒为假），condition_probability=0" }
 ```
 
+## 改版对比示例（POST /v1/compare-trees）
+
+请求**共用一份 `events`**（格式与校验同 `/v1/analyze`），另以 `baseline`、`revised`
+分别给出两版各自的 `gates` 与 `top`。两版各自沿用现有校验（元数、未知引用、环等）；
+**门 id 在两版间可同名但定义独立**，每版只能引用共享事件与自己的门，**不能跨版引用**；
+同一事件在两版共享状态与先验。设两版顶事件为 `B`、`R`：
+
+- `added_probability`：`P(¬B∧R)`——修订版新发生而基线版不发生的概率，约分 `n/d`；
+- `removed_probability`：`P(B∧¬R)`——基线版发生而修订版不再发生的概率，约分 `n/d`；
+- `change_probability`：`P(B⊕R)`——两版结果不同的总概率，约分 `n/d`；
+- `equivalent`：仅在**全部事件赋值**下 `B` 与 `R` 都相同时为 `true`；
+  **零概率赋值上的差异仍算不等价**（与事件概率无关的函数等价判定）。
+
+计算用同一变量顺序（事件 id 字典序）在同一共享 ROBDD 上先后构建两版并做差异运算，
+精确加权，不枚举事件赋值；两版建图及差异运算累计非终端节点超过 **50000** 时返回 422。
+
+仍以电机冷却系统为例：改版把冷却失效改为双冗余——冷却液流失与泵失效**同时**发生
+才导致冷却失效（两版门 id 同名、定义各自独立）：
+
+```bash
+curl -X POST http://localhost:8000/v1/compare-trees \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "motor_overheat", "p": "1/100"},
+      {"id": "coolant_loss",  "p": "2/100"},
+      {"id": "pump_fail",     "p": "1/200"}
+    ],
+    "baseline": {
+      "gates": [
+        {"id": "cooling_fail", "op": "OR",
+         "inputs": ["coolant_loss", "pump_fail"]},
+        {"id": "top", "op": "OR",
+         "inputs": ["motor_overheat", "cooling_fail"]}
+      ],
+      "top": "top"
+    },
+    "revised": {
+      "gates": [
+        {"id": "cooling_fail", "op": "AND",
+         "inputs": ["coolant_loss", "pump_fail"]},
+        {"id": "top", "op": "OR",
+         "inputs": ["motor_overheat", "cooling_fail"]}
+      ],
+      "top": "top"
+    }
+  }'
+```
+
+响应：
+
+```json
+{
+  "added_probability": "0/1",
+  "removed_probability": "3069/125000",
+  "change_probability": "3069/125000",
+  "equivalent": false
+}
+```
+
+- 改版后 `R ⊆ B`（双冗余不会引入新的顶事件情形），故 `added_probability = 0/1`。
+- `removed_probability = P(¬motor_overheat)·P(coolant_loss ⊕ pump_fail)`
+  `= 99/100 · (2/100·199/200 + 98/100·1/200) = 3069/125000`。
+- 两版函数不等价（`equivalent: false`）：例如仅 `coolant_loss` 发生时基线版顶事件
+  发生而修订版不发生。
+- 即使差异只出现在零概率赋值上（如某事件 `p` 为 `0/1`），三个概率全为 `0/1` 时
+  `equivalent` 仍为 `false`——等价性按全部赋值判定，与概率取值无关。
+- 跨版引用（如 `baseline` 的门引用只在 `revised` 中定义的门 id）按未知引用返回 422。
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -441,6 +514,7 @@ curl -X POST http://localhost:8000/v1/likely-cause \
 | `observations`（仅 `/v1/inspect-next`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；表示已有读数 |
 | `candidates`（仅 `/v1/inspect-next`） | 必填，**1～16** 个互异、已声明且未被观测的事件或门 id |
 | `observations`（仅 `/v1/likely-cause`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；与顶事件发生一起构成条件 `C` |
+| `baseline` / `revised`（仅 `/v1/compare-trees`） | 必填，各含 `gates`（0～64 个，可省略）与 `top`；两版共用请求顶层的 `events`，门 id 可跨版同名但定义独立，不能跨版引用 |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -452,6 +526,10 @@ curl -X POST http://localhost:8000/v1/likely-cause \
 `/v1/likely-cause` 把顶事件与各观测约束合取为 `C` 后在同一 ROBDD 上做动态规划：
 自底向上求每个节点子图取 1 的最大先验乘积（路径跳过的自由变量按 `max(p, 1−p)` 补计），
 再自顶向下在并列时优先低分支（`false`）走出最优赋值，全程不枚举事件状态。
+`/v1/compare-trees` 在同一共享 ROBDD 中以同一变量顺序先后构建两版顶事件 `B`、`R`
+（事件基础变量节点经唯一表共用），再经 ITE 算出 `¬B∧R`、`B∧¬R`、`B⊕R` 三个差异根，
+对唯一表一次自底向上加权即同时读出三个概率；ROBDD 规范化保证 `B⊕R` 为终端 0
+当且仅当两版函数在全部赋值下一致，故 `equivalent` 与事件概率取值无关。
 
 ## 错误处理（HTTP 422）
 
@@ -476,9 +554,13 @@ curl -X POST http://localhost:8000/v1/likely-cause \
 - `/v1/likely-cause` 的 `observations` 超过 **16** 个或键/值非法（同 `/v1/diagnose`）；
 - `/v1/likely-cause` 的 `condition_probability = P(C) = 0`：顶事件与读数在结构上
   相互矛盾（合取恒假），或结构可满足但先验下无正概率支持，响应说明具体原因；
+- `/v1/compare-trees` 的 `baseline` / `revised` 缺失或格式非法、某一版引用未知 id
+  （含跨版引用另一版定义的门）、某一版门引用关系存在环等（两版各自沿用现有校验）；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
   （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next`
-  与 `/v1/likely-cause`，后三者含合取观测约束与候选分支新增的节点）。
+  与 `/v1/likely-cause`，后三者含合取观测约束与候选分支新增的节点）；
+- `/v1/compare-trees` 两版建图及差异运算在共享 ROBDD 上累计的非终端节点
+  超过 **50000** 个。
 
 环示例响应：
 
@@ -519,4 +601,5 @@ tests/test_repair.py
 tests/test_diagnose.py
 tests/test_inspect_next.py
 tests/test_likely_cause.py
+tests/test_compare_trees.py
 ```
