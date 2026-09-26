@@ -51,13 +51,26 @@ POST /v1/likely-cause
   概率计算；复用 ROBDD 精确求最优赋值，不枚举事件状态；P(C)=0
   或累计非终端节点超过 50000 时返回 422。
 
-所有错误输入（未知引用、环、非法概率、节点超限等）统一返回 422。
+POST /v1/compare-trees
+  输入：共用一份 events（1~32 个独立事件，概率为 n/d 分数字符串），
+        baseline 与 revised 各提供 gates（0~64 个布尔门 AND/OR/NOT）
+        与顶层节点 top；两版各自沿用 /v1/analyze 的全部校验，门 id
+        可同名但定义相互独立，不能跨版引用，同一事件在两版共享状态
+        与先验。
+  输出：设两版顶事件为 B、R，added_probability=P(¬B∧R)、
+        removed_probability=P(B∧¬R)、change_probability=P(B⊕R)，
+        均为约分 n/d；equivalent 仅在全部事件赋值下 B 与 R 都相同
+        时为 true（零概率赋值上的差异仍算不等价）。用同一变量顺序
+        与共享 ROBDD 精确计算，不枚举事件状态；两版建图及差异运算
+        累计非终端节点超过 50000 时返回 422。
+
+所有错误输入（未知引用、跨版引用、环、非法概率、节点超限等）统一返回 422。
 """
 
 from __future__ import annotations
 
 from fractions import Fraction
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -220,6 +233,40 @@ class LikelyCauseResponse(BaseModel):
     )
 
 
+class TreeVersion(BaseModel):
+    """/v1/compare-trees 中一个版本的故障树：gates 与顶层节点 top。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    gates: List[GateIn] = Field(default_factory=list, max_length=64)
+    top: str = Field(..., min_length=1, description="顶层节点 id（事件或门）")
+
+
+class CompareTreesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=32)
+    baseline: TreeVersion = Field(..., description="基线版本的 gates 与 top")
+    revised: TreeVersion = Field(..., description="改版版本的 gates 与 top")
+
+
+class CompareTreesResponse(BaseModel):
+    added_probability: str = Field(
+        ..., description="P(¬B∧R)：改版新增顶事件情形的概率，约分 n/d"
+    )
+    removed_probability: str = Field(
+        ..., description="P(B∧¬R)：改版移除顶事件情形的概率，约分 n/d"
+    )
+    change_probability: str = Field(
+        ..., description="P(B⊕R)：两版顶事件不一致的概率，约分 n/d"
+    )
+    equivalent: bool = Field(
+        ...,
+        description="全部事件赋值下 B 与 R 都相同时为 true；"
+        "零概率赋值上的差异仍算不等价",
+    )
+
+
 def _bad_request(reason: str) -> JSONResponse:
     return JSONResponse(status_code=422, content={"detail": reason})
 
@@ -249,17 +296,8 @@ def _is_ascii_nonempty(s: str) -> bool:
     return len(s) > 0 and s.isascii()
 
 
-def _validate_payload(
-    payload: AnalyzeRequest,
-) -> "tuple[Dict[str, Fraction], Dict[str, GateOp], Dict[str, List[str]]]":
-    """事件与门的全部静态校验，返回 (事件概率表, 门算子表, 门输入表)。
-
-    非法概率、id 冲突/重复、元数错误、未知引用、环等均抛 ValueError。
-    """
-    events = payload.events
-    gates = payload.gates
-
-    # ---- 事件：id、概率 ----
+def _validate_events(events: List[EventIn]) -> Dict[str, Fraction]:
+    """事件 id 与概率的静态校验，返回事件概率表。"""
     probs: Dict[str, Fraction] = {}
     for ev in events:
         if not _is_ascii_nonempty(ev.id):
@@ -267,7 +305,20 @@ def _validate_payload(
         if ev.id in probs:
             raise ValueError(f"事件 id 重复：{ev.id!r}")
         probs[ev.id] = _parse_probability(ev.p)
+    return probs
 
+
+def _validate_gates(
+    probs: Dict[str, Fraction],
+    gates: List[GateIn],
+    top: str,
+) -> "tuple[Dict[str, GateOp], Dict[str, List[str]]]":
+    """门与顶层节点的全部静态校验，返回 (门算子表, 门输入表)。
+
+    id 冲突/重复、元数错误、未知引用、环等均抛 ValueError；引用只能
+    指向 probs 中的事件或本门列表内的门（对 /v1/compare-trees 而言
+    即同一版本内的门，跨版引用由调用方先行拦截）。
+    """
     # ---- 门：id、算子输入元数、重复 ----
     gate_ops: Dict[str, GateOp] = {}
     gate_inputs: Dict[str, List[str]] = {}
@@ -298,8 +349,8 @@ def _validate_payload(
         for ref in inputs:
             if ref not in known_ids:
                 raise ValueError(f"门 {gid!r} 引用了未知节点：{ref!r}")
-    if payload.top not in known_ids:
-        raise ValueError(f"顶层节点引用了未知 id：{payload.top!r}")
+    if top not in known_ids:
+        raise ValueError(f"顶层节点引用了未知 id：{top!r}")
 
     # ---- 环检测：门依赖图上的 DFS 三色标记 ----
     # 0=未访问, 1=在当前递归栈中, 2=已完成
@@ -320,7 +371,56 @@ def _validate_payload(
     for gid in gate_ops:
         dfs(gid)
 
+    return gate_ops, gate_inputs
+
+
+def _validate_payload(
+    payload: AnalyzeRequest,
+) -> "tuple[Dict[str, Fraction], Dict[str, GateOp], Dict[str, List[str]]]":
+    """事件与门的全部静态校验，返回 (事件概率表, 门算子表, 门输入表)。
+
+    非法概率、id 冲突/重复、元数错误、未知引用、环等均抛 ValueError。
+    """
+    probs = _validate_events(payload.events)
+    gate_ops, gate_inputs = _validate_gates(probs, payload.gates, payload.top)
     return probs, gate_ops, gate_inputs
+
+
+def _make_evaluator(
+    bdd: ROBDD,
+    event_nodes: Dict[str, int],
+    gate_ops: Dict[str, GateOp],
+    gate_inputs: Dict[str, List[str]],
+) -> Tuple[Callable[[str], int], Dict[str, int]]:
+    """返回 (按 id 求值门的函数, 已建门节点表)，在共享 ROBDD 上求值。
+
+    同一事件的多处引用共用同一个基础变量节点；NOT 门以 BDD 取反求值。
+    已建门节点表归属单次调用：/v1/compare-trees 两版各自求值时同名
+    门的定义互不影响，但全部节点都落在同一唯一表中。
+    """
+    built: Dict[str, int] = {}
+
+    def eval_node(node_id: str) -> int:
+        if node_id in event_nodes:
+            return event_nodes[node_id]
+        if node_id in built:
+            return built[node_id]
+        op = gate_ops[node_id]
+        inputs = gate_inputs[node_id]
+        if op == "NOT":
+            result = bdd.negate(eval_node(inputs[0]))
+        else:
+            result = eval_node(inputs[0])
+            for ref in inputs[1:]:
+                nxt = eval_node(ref)
+                if op == "AND":
+                    result = bdd.and_(result, nxt)
+                else:
+                    result = bdd.or_(result, nxt)
+        built[node_id] = result
+        return result
+
+    return eval_node, built
 
 
 def build_tree_robdd(
@@ -349,28 +449,7 @@ def build_tree_robdd(
         eid: bdd.mk(var_index[eid], 0, 1) for eid in sorted_events
     }
 
-    built: Dict[str, int] = {}
-
-    def eval_node(node_id: str) -> int:
-        if node_id in event_nodes:
-            return event_nodes[node_id]
-        if node_id in built:
-            return built[node_id]
-        op = gate_ops[node_id]
-        inputs = gate_inputs[node_id]
-        if op == "NOT":
-            result = bdd.negate(eval_node(inputs[0]))
-        else:
-            result = eval_node(inputs[0])
-            for ref in inputs[1:]:
-                nxt = eval_node(ref)
-                if op == "AND":
-                    result = bdd.and_(result, nxt)
-                else:
-                    result = bdd.or_(result, nxt)
-        built[node_id] = result
-        return result
-
+    eval_node, built = _make_evaluator(bdd, event_nodes, gate_ops, gate_inputs)
     top_node = eval_node(top)
     for node_id in also:
         eval_node(node_id)
@@ -778,6 +857,91 @@ def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
     )
 
 
+def _validate_version_gates(
+    probs: Dict[str, Fraction],
+    version: TreeVersion,
+    other: TreeVersion,
+    label: str,
+) -> "tuple[Dict[str, GateOp], Dict[str, List[str]]]":
+    """校验 /v1/compare-trees 一个版本的 gates/top，返回 (门算子表, 门输入表)。
+
+    两版门 id 可同名但定义相互独立：引用只能指向共享事件或本版本的
+    门；指向另一版本独有的门 id 属于跨版引用，先行拦截并单独说明，
+    其余校验（元数、未知引用、环等）与 /v1/analyze 完全一致。
+    """
+    own_gate_ids = {g.id for g in version.gates}
+    other_gate_ids = {g.id for g in other.gates}
+
+    def is_cross_ref(ref: str) -> bool:
+        return (
+            ref not in probs
+            and ref not in own_gate_ids
+            and ref in other_gate_ids
+        )
+
+    cross = sorted(
+        {ref for g in version.gates for ref in g.inputs if is_cross_ref(ref)}
+        | ({version.top} if is_cross_ref(version.top) else set())
+    )
+    if cross:
+        raise ValueError(
+            f"{label} 跨版引用了另一版本的门："
+            + ", ".join(repr(c) for c in cross)
+            + "；两版门 id 可同名但定义相互独立，不能跨版引用"
+        )
+    return _validate_gates(probs, version.gates, version.top)
+
+
+def compare_trees_logic(payload: CompareTreesRequest) -> CompareTreesResponse:
+    # 事件共用一份：id、概率校验一次，两版共享状态与先验
+    probs = _validate_events(payload.events)
+    base_ops, base_inputs = _validate_version_gates(
+        probs, payload.baseline, payload.revised, "baseline"
+    )
+    rev_ops, rev_inputs = _validate_version_gates(
+        probs, payload.revised, payload.baseline, "revised"
+    )
+
+    sorted_events = sorted(probs)
+    var_index = {eid: i for i, eid in enumerate(sorted_events)}
+
+    # 两版共用同一变量顺序与同一 ROBDD（同一唯一表），节点限额对
+    # 两版建图及后续差异运算累计生效
+    bdd = ROBDD(n_vars=len(sorted_events), limit=MAX_NONTERMINAL_NODES)
+    event_nodes = {
+        eid: bdd.mk(var_index[eid], 0, 1) for eid in sorted_events
+    }
+
+    base_eval, _ = _make_evaluator(bdd, event_nodes, base_ops, base_inputs)
+    rev_eval, _ = _make_evaluator(bdd, event_nodes, rev_ops, rev_inputs)
+    base_top = base_eval(payload.baseline.top)
+    rev_top = rev_eval(payload.revised.top)
+
+    # ROBDD 规范化：根节点相同 ⟺ 全部事件赋值下两版顶事件取值都相同
+    # （零概率赋值上的差异同样体现为不同节点，仍算不等价）
+    equivalent = base_top == rev_top
+
+    # 差异运算：added = ¬B∧R，removed = B∧¬R，change = B⊕R（两者之并）
+    added = bdd.and_(bdd.negate(base_top), rev_top)
+    removed = bdd.and_(base_top, bdd.negate(rev_top))
+    change = bdd.or_(added, removed)
+
+    # 对唯一表做一次自底向上加权，同时读出三个差异根的概率
+    prob_list = [probs[eid] for eid in sorted_events]
+    node_prob = bdd.node_probabilities(prob_list)
+
+    def frac_string(value: Fraction) -> str:
+        # 统一输出约分后的 n/d（整数时分母为 1）
+        return f"{value.numerator}/{value.denominator}"
+
+    return CompareTreesResponse(
+        added_probability=frac_string(node_prob[added]),
+        removed_probability=frac_string(node_prob[removed]),
+        change_probability=frac_string(node_prob[change]),
+        equivalent=equivalent,
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
@@ -867,4 +1031,16 @@ async def likely_cause(payload: LikelyCauseRequest) -> LikelyCauseResponse:
         return _bad_request(str(exc))  # type: ignore[return-value]
     except ValueError as exc:
         # 未知引用、环、非法观测键、条件矛盾或联合概率为 0 等语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post("/v1/compare-trees", response_model=CompareTreesResponse)
+async def compare_trees(payload: CompareTreesRequest) -> CompareTreesResponse:
+    try:
+        return compare_trees_logic(payload)
+    except NodeLimitExceeded as exc:
+        # 两版建图及差异运算累计非终端节点超过限制
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ValueError as exc:
+        # 非法概率、未知引用、跨版引用、环、元数错误等全部语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]
